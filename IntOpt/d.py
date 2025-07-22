@@ -1,4 +1,4 @@
-    import numpy as np
+import numpy as np
 from scipy.ndimage import maximum_filter
 from scipy.optimize import curve_fit
 from PIL import Image

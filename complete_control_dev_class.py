@@ -63,16 +63,16 @@ class AWG:
             exit(1)
 
         # Configure the reference clock (if required)
-        # if refClock == True:
-        #     spcm_dwSetParam_i32 (self.hCard, SPC_CLOCKMODE, SPC_CM_EXTREFCLOCK); # Set to reference clock mode
-        #     spcm_dwSetParam_i32 (self.hCard, SPC_REFERENCECLOCK, refClockFreq); # Reference clock that is fed in at the Clock Frequency
-        #     if self.checkExtClock() == True:
-        #         print("Clock has been set\n")
-        #     else:
-        #         print("External Clock not found, please check connection to external clock or set referenceClock to False.\n")
-        #         spcm_dwSetParam_i32 (self.hCard, SPC_CLOCKMODE, SPC_CM_INTPLL) # Enables internal programmable quartz 1
-        # else:
-        #     print("Using internal clock\n")
+        if refClock == True:
+            spcm_dwSetParam_i32 (self.hCard, SPC_CLOCKMODE, SPC_CM_EXTREFCLOCK); # Set to reference clock mode
+            spcm_dwSetParam_i32 (self.hCard, SPC_REFERENCECLOCK, refClockFreq); # Reference clock that is fed in at the Clock Frequency
+            if self.checkExtClock() == True:
+                print("Clock has been set\n")
+            else:
+                print("External Clock not found, please check connection to external clock or set referenceClock to False.\n")
+                spcm_dwSetParam_i32 (self.hCard, SPC_CLOCKMODE, SPC_CM_INTPLL) # Enables internal programmable quartz 1
+        else:
+            print("Using internal clock\n")
 
         # Set sample rate
         spcm_dwSetParam_i64(self.hCard, SPC_SAMPLERATE, MEGA(R))
