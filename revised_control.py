@@ -1,4 +1,5 @@
 import logging
+import numpy as np
 from ctypes import create_string_buffer, byref, c_void_p, cast, POINTER, c_int32, c_int64, c_uint64, c_int16
 from pyspcm import *
 from spcm_tools import *
@@ -12,7 +13,7 @@ class AWG:
         self.channels = channels
         self.use_ext_clock = use_ext_clock
         self.ext_clock_freq = ext_clock_freq
-        
+
         self._open_card()
         self._reset_card()
         self._check_card_type()
@@ -60,24 +61,29 @@ class AWG:
         logging.info("Sample rate set to %d MHz", self.sample_rate)
 
     def _configure_memory(self):
+        # calculate total memory points (multiple of 32)
         total_samples = int(self.sample_rate * 1e6 * self.time_s)
         self.mem_size = 32 * ((total_samples + 31) // 32)
-        self.qwBufferSize = c_uint64(self.mem_size * len(self.channels) * c_int16().value)
-        logging.info("Memory: %d samples, buffer size: %d bytes", self.mem_size, self.qwBufferSize.value)
+        logging.info("Configured memory: %d points", self.mem_size)
 
     def _configure_channels(self):
+        # enable channels and standard replay mode
         mask = sum(1 << ch for ch in self.channels)
         spcm_dwSetParam_i32(self.hCard, SPC_CARDMODE, SPC_REP_STD_SINGLE)
         spcm_dwSetParam_i64(self.hCard, SPC_CHENABLE, mask)
         spcm_dwSetParam_i64(self.hCard, SPC_MEMSIZE, self.mem_size)
         spcm_dwSetParam_i64(self.hCard, SPC_LOOPS, 0)
+        # enable outputs
         for ch in self.channels:
             spcm_dwSetParam_i64(self.hCard, SPC_ENABLEOUT0 + ch, 1)
-        bytes_per_sample = c_int32()
-        spcm_dwGetParam_i32(self.hCard, SPC_MIINST_BYTESPERSAMPLE, byref(bytes_per_sample))
-        logging.info("Bytes per sample: %d", bytes_per_sample.value)
+        # retrieve bytes per sample for buffer sizing
+        bps = c_int32()
+        spcm_dwGetParam_i32(self.hCard, SPC_MIINST_BYTESPERSAMPLE, byref(bps))
+        self.bytes_per_sample = bps.value
+        logging.info("Channels %s enabled, bytes/sample: %d", self.channels, self.bytes_per_sample)
 
     def _configure_trigger(self):
+        # software trigger only
         spcm_dwSetParam_i32(self.hCard, SPC_TRIG_ORMASK, SPC_TMASK_SOFTWARE)
         spcm_dwSetParam_i32(self.hCard, SPC_TRIGGEROUT, 0)
 
@@ -87,32 +93,48 @@ class AWG:
         logging.info("Amplitude set to %d mV on channels %s", mV, self.channels)
 
     def _allocate_buffer(self):
+        # compute required buffer size in bytes
+        buffer_bytes = self.mem_size * self.bytes_per_sample * len(self.channels)
+        self.qwBufferSize = c_uint64(buffer_bytes)
+        # try continuous buffer
         ptr = c_void_p()
         length = c_uint64()
         spcm_dwGetContBuf_i64(self.hCard, SPCM_BUF_DATA, byref(ptr), byref(length))
-        if length.value < self.qwBufferSize.value:
-            ptr = pvAllocMemPageAligned(self.qwBufferSize.value)
-            logging.info("Allocated program buffer")
+        if length.value < buffer_bytes:
+            ptr = pvAllocMemPageAligned(buffer_bytes)
+            logging.info("Allocated user buffer: %d bytes", buffer_bytes)
+        else:
+            logging.info("Using continuous buffer: %d bytes", length.value)
         self.pvBuffer = ptr
         self.pnBuffer = cast(self.pvBuffer, POINTER(c_int16))
+        # get ADC range for scaling
         max_adc = c_int32()
         spcm_dwGetParam_i32(self.hCard, SPC_MIINST_MAXADCVALUE, byref(max_adc))
         self.offset = max_adc.value // 2
         logging.info("ADC max value: %d, offset: %d", max_adc.value, self.offset)
 
     def transfer_data(self, func_x, func_y):
+        # fill buffer with two-channel interleaved data
         n = min(len(func_x), len(func_y), self.mem_size)
         for i in range(n):
-            self.pnBuffer[2*i] = int(self.offset * func_x[i])
-            self.pnBuffer[2*i + 1] = int(self.offset * func_y[i])
-        for i in range(2 * n, self.mem_size * len(self.channels)):
+            v0 = c_int16(int(self.offset * func_x[i])).value
+            v1 = c_int16(int(self.offset * func_y[i])).value
+            self.pnBuffer[2*i]     = v0
+            self.pnBuffer[2*i + 1] = v1
+        # zero-pad remaining memory
+        total_vals = self.mem_size * len(self.channels)
+        for i in range(2*n, total_vals):
             self.pnBuffer[i] = 0
-        logging.info("Data transferred into buffer: %d samples", n)
+        logging.info("Transferred %d samples into buffer", n)
 
     def execute(self):
-        spcm_dwDefTransfer_i64(self.hCard, SPCM_BUF_DATA, SPCM_DIR_PCTOCARD, 0, self.pvBuffer, 0, self.qwBufferSize)
-        spcm_dwSetParam_i32(self.hCard, SPC_M2CMD, M2CMD_DATA_STARTDMA | M2CMD_DATA_WAITDMA)
-        err = spcm_dwSetParam_i32(self.hCard, SPC_M2CMD, M2CMD_CARD_START | M2CMD_CARD_ENABLETRIGGER)
+        # DMA transfer then start
+        spcm_dwDefTransfer_i64(self.hCard, SPCM_BUF_DATA, SPCM_DIR_PCTOCARD,
+                              0, self.pvBuffer, 0, self.qwBufferSize)
+        spcm_dwSetParam_i32(self.hCard, SPC_M2CMD,
+                            M2CMD_DATA_STARTDMA | M2CMD_DATA_WAITDMA)
+        err = spcm_dwSetParam_i32(self.hCard, SPC_M2CMD,
+                                   M2CMD_CARD_START | M2CMD_CARD_ENABLETRIGGER)
         if err != ERR_OK:
             spcm_dwSetParam_i32(self.hCard, SPC_M2CMD, M2CMD_CARD_STOP)
             raise RuntimeError(f"Error starting output: {err}")
